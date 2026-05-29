@@ -18,8 +18,8 @@ Bulk-export all collections from a MongoDB Atlas cluster as compressed JSON.
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/atlas-export.git
-cd atlas-export
+git clone https://github.com/aukjan/mongo-export.git
+cd mongo-export
 chmod +x atlas-export.sh
 ```
 
@@ -63,6 +63,7 @@ OPTIONAL
   --output-dir <dir>        Base output directory           (default: ./atlas-export)
   --max-file-size <size>    Split threshold per file        (default: 500M)
                             Accepts K/KB, M/MB, G/GB
+  --backup-name <name>      Prefix for the zip file name    (default: none)
   --keep-raw                Keep uncompressed files after zipping
   --help                    Show help message
 ```
@@ -81,6 +82,10 @@ OPTIONAL
 
 # Custom split threshold (100 MB) and output directory
 ./atlas-export.sh --max-file-size 100M --output-dir ./backups
+
+# Add a prefix to the zip filename
+./atlas-export.sh --backup-name daily
+# → daily_MyProject_Production_20260529_143022.zip
 
 # Use a different env file
 ./atlas-export.sh --env-file .env.production
@@ -102,6 +107,7 @@ The script loads `.env` from the current directory by default. CLI flags always 
 | `ATLAS_CLUSTER` | Cluster name |
 | `ATLAS_FILTER` | Database name filter (substring) |
 | `ATLAS_OUTPUT_DIR` | Output directory |
+| `ATLAS_BACKUP_NAME` | Prefix for the zip file name |
 | `ATLAS_MAX_FILE_SIZE` | Split threshold (e.g. `500M`) |
 
 ## Output Structure
@@ -130,11 +136,21 @@ Collections exceeding `--max-file-size` (default 500 MB) are automatically split
 - Failed exports are logged to `export-errors.log` in the output directory
 - A summary is printed at the end showing successes and failures
 
-## Security Notes
+## Security
 
-- Passwords with special characters are automatically URL-encoded
-- The connection URI is never printed to logs (password is masked)
-- Add `.env` to your `.gitignore` to avoid committing credentials
+- **Credentials hidden from process list** — `mongoexport` uses a config file instead of passing the URI on the command line, so passwords aren't visible in `ps` output
+- **Restrictive file permissions** — `umask 077` ensures exported data is readable only by the owner
+- **.env permissions check** — warns if `.env` is readable by other users (recommends `chmod 600`)
+- **Path traversal protection** — database and collection names are sanitized before being used in file paths
+- **Password masking** — the connection URI is never printed to logs
+- **URL encoding** — special characters in passwords are automatically handled
+- **Ctrl+C** gracefully aborts the entire export and cleans up temp files
+
+### Recommended .env permissions
+
+```bash
+chmod 600 .env
+```
 
 ## License
 

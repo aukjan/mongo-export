@@ -12,8 +12,19 @@
 
 set -euo pipefail
 
-# Ensure Ctrl+C aborts the entire script, not just the current subprocess.
-trap 'printf "\n[ABORT] Export cancelled by user.\n" >&2; exit 130' INT TERM
+# Restrict file permissions: only owner can read/write exported data.
+umask 077
+
+# Temp directory for config files (credentials); cleaned up on exit.
+TMPDIR_SECURE=$(mktemp -d)
+
+cleanup() {
+    rm -rf "$TMPDIR_SECURE"
+}
+
+# Ensure Ctrl+C aborts the entire script and cleans up temp files.
+trap 'printf "\n[ABORT] Export cancelled by user.\n" >&2; cleanup; exit 130' INT TERM
+trap cleanup EXIT
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
@@ -179,6 +190,12 @@ check_prerequisites() {
     fi
 }
 
+# Sanitize a name for use as a filesystem path component.
+# Prevents path traversal via "../" or absolute paths in db/collection names.
+sanitize_name() {
+    printf '%s' "$1" | tr '/\\' '__' | sed 's/^\.\.*//'
+}
+
 # Split a JSON file into numbered parts if it exceeds the threshold.
 # Returns 0 if the file was split, 1 if no split was needed.
 split_large_file() {
@@ -236,6 +253,17 @@ for (( i=1; i<=$#; i++ )); do
 done
 
 if [[ "$SKIP_ENV" == false && -f "$ENV_FILE" ]]; then
+    # Warn if .env is readable by group or others (contains credentials).
+    local_perms=""
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local_perms=$(stat -f%Lp "$ENV_FILE" 2>/dev/null)
+    else
+        local_perms=$(stat -c%a "$ENV_FILE" 2>/dev/null)
+    fi
+    if [[ -n "$local_perms" && "$local_perms" != "600" && "$local_perms" != "400" ]]; then
+        log_warn "$ENV_FILE is accessible to other users (mode $local_perms). Recommend: chmod 600 $ENV_FILE"
+    fi
+
     log_info "Loading settings from $ENV_FILE"
     # Source only well-formed KEY=VALUE lines; ignore comments and blank lines.
     while IFS='=' read -r key value; do
@@ -312,6 +340,10 @@ ENCODED_PASS=$(urlencode "$PASSWORD")
 URI="mongodb+srv://${ENCODED_USER}:${ENCODED_PASS}@${HOST}"
 MASKED_URI="mongodb+srv://${ENCODED_USER}:****@${HOST}"
 
+# Write a config file for mongoexport (avoids credentials in ps output).
+MONGOEXPORT_CONFIG="${TMPDIR_SECURE}/mongoexport.yaml"
+printf 'uri: "%s"\n' "$URI" > "$MONGOEXPORT_CONFIG"
+
 # ─── Prepare Output Directories ─────────────────────────────────────────────
 
 EXPORT_BASE="${OUTPUT_DIR}/${PROJECT}/${CLUSTER}"
@@ -379,7 +411,7 @@ while IFS= read -r db; do
     echo >&2
     log_info "[$DB_NUM/$TOTAL_DBS] Database: ${BOLD}${db}${NC}"
 
-    DB_DIR="${EXPORT_BASE}/${db}"
+    DB_DIR="${EXPORT_BASE}/$(sanitize_name "$db")"
     mkdir -p "$DB_DIR"
 
     # List collections for this database.
@@ -401,12 +433,12 @@ while IFS= read -r db; do
         [[ -z "$col" ]] && continue
         COL_NUM=$(( COL_NUM + 1 ))
 
-        OUT_FILE="${DB_DIR}/${col}.json"
+        OUT_FILE="${DB_DIR}/$(sanitize_name "$col").json"
         log_info "  [$COL_NUM/$COL_COUNT] ${db}.${col}"
 
         # mongoexport writes one JSON document per line (line-delimited JSON).
         if mongoexport \
-                --uri="$URI" \
+                --config="$MONGOEXPORT_CONFIG" \
                 --db="$db" \
                 --collection="$col" \
                 --type=json \
