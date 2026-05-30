@@ -42,6 +42,13 @@ KEEP_RAW=false
 SYSTEM_DBS="admin local config"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
+# ─── Executable Paths (resolved by check_prerequisites) ─────────────────────
+
+MONGOSH=""
+MONGOEXPORT=""
+ZIP_CMD=""
+SPLIT_CMD=""
+
 # ─── Counters ────────────────────────────────────────────────────────────────
 
 TOTAL_DBS=0
@@ -175,12 +182,54 @@ format_size() {
     fi
 }
 
-# Verify required CLI tools are available.
+# Resolve the full path for a required executable.
+# Search order: script directory → current working directory → PATH.
+# Prints the resolved path on success, returns 1 on failure.
+resolve_executable() {
+    local name="$1"
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+    # 1. Script's own directory.
+    if [[ -x "${script_dir}/${name}" ]]; then
+        printf '%s' "${script_dir}/${name}"
+        return 0
+    fi
+
+    # 2. Current working directory (skip if same as script dir).
+    if [[ "$(pwd)" != "$script_dir" && -x "./${name}" ]]; then
+        printf '%s' "$(pwd)/${name}"
+        return 0
+    fi
+
+    # 3. Fall back to PATH.
+    local found
+    if found=$(command -v "$name" 2>/dev/null); then
+        printf '%s' "$found"
+        return 0
+    fi
+
+    return 1
+}
+
+# Verify required CLI tools are available and resolve their paths.
 check_prerequisites() {
     local missing=()
+    local path
+
     for cmd in mongosh mongoexport zip split; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+        if path=$(resolve_executable "$cmd"); then
+            case "$cmd" in
+                mongosh)     MONGOSH="$path" ;;
+                mongoexport) MONGOEXPORT="$path" ;;
+                zip)         ZIP_CMD="$path" ;;
+                split)       SPLIT_CMD="$path" ;;
+            esac
+        else
+            missing+=("$cmd")
+        fi
     done
+
     if (( ${#missing[@]} )); then
         log_error "Missing required tools: ${missing[*]}"
         echo >&2
@@ -188,6 +237,12 @@ check_prerequisites() {
         echo "  zip                   → brew install zip  /  apt install zip" >&2
         exit 1
     fi
+
+    log_info "Resolved executables:"
+    log_info "  mongosh       → $MONGOSH"
+    log_info "  mongoexport   → $MONGOEXPORT"
+    log_info "  zip           → $ZIP_CMD"
+    log_info "  split         → $SPLIT_CMD"
 }
 
 # Sanitize a name for use as a filesystem path component.
@@ -216,7 +271,7 @@ split_large_file() {
     local base="${file%.json}"
 
     # split creates <base>.partaa, <base>.partab, …
-    split -l "$lines_per_chunk" "$file" "${base}.part"
+    "$SPLIT_CMD" -l "$lines_per_chunk" "$file" "${base}.part"
 
     # Rename to <base>.part001.json, .part002.json, …
     local n=1
@@ -356,7 +411,7 @@ ERROR_LOG="${OUTPUT_DIR}/export-errors.log"
 
 log_info "Connecting to ${MASKED_URI} …"
 
-if ! mongosh "$URI" --quiet --eval 'db.adminCommand({ping:1})' &>/dev/null; then
+if ! "$MONGOSH" "$URI" --quiet --eval 'db.adminCommand({ping:1})' &>/dev/null; then
     log_error "Connection failed. Verify host, username, and password."
     exit 1
 fi
@@ -366,7 +421,7 @@ log_ok "Connected"
 
 log_info "Listing databases…"
 
-ALL_DBS=$(mongosh "$URI" --quiet --eval '
+ALL_DBS=$("$MONGOSH" "$URI" --quiet --eval '
     db.adminCommand({listDatabases:1})
       .databases.map(d => d.name).join("\n")
 ')
@@ -415,7 +470,7 @@ while IFS= read -r db; do
     mkdir -p "$DB_DIR"
 
     # List collections for this database.
-    COLLECTIONS=$(mongosh "${URI}/${db}" --quiet --eval '
+    COLLECTIONS=$("$MONGOSH" "${URI}/${db}" --quiet --eval '
         db.getCollectionNames().join("\n")
     ' 2>/dev/null || true)
 
@@ -437,7 +492,7 @@ while IFS= read -r db; do
         log_info "  [$COL_NUM/$COL_COUNT] ${db}.${col}"
 
         # mongoexport writes one JSON document per line (line-delimited JSON).
-        if mongoexport \
+        if "$MONGOEXPORT" \
                 --config="$MONGOEXPORT_CONFIG" \
                 --db="$db" \
                 --collection="$col" \
@@ -474,7 +529,7 @@ else
 fi
 ZIP_PATH="${OUTPUT_DIR}/${ZIP_NAME}"
 
-( cd "$OUTPUT_DIR" && zip -r -q "$ZIP_NAME" "${PROJECT}/" )
+( cd "$OUTPUT_DIR" && "$ZIP_CMD" -r -q "$ZIP_NAME" "${PROJECT}/" )
 
 ZIP_SIZE=$(get_file_size "$ZIP_PATH")
 log_ok "Archive: ${ZIP_PATH} ($(format_size "$ZIP_SIZE"))"
